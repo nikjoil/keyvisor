@@ -1,0 +1,20 @@
+# Python virtual environment (самое важное)
+venv/
+env/
+.env
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE specific files
+.vscode/
+.idea/
+
+# macOS temp files (если есть маководы в команде)
+.DS_Store
