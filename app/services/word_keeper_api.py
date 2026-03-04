@@ -22,6 +22,10 @@ class WordKeeperService:
         self.last_project_id = None
         self.last_project_name = None
 
+        self.token = (settings.WK_TOKEN or "").strip()
+        if not self.token:
+            raise ValueError("WORDKEEPER_TOKEN is empty after strip()")
+
     def _post(self, method: str, data: dict):
         data["token"] = self.token
         url = f"{self.base_url}/{method}"

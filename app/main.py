@@ -323,13 +323,29 @@ async def start_harvester(
         )
 
         # --- TOPVISOR ---
+# --- TOPVISOR ---
         tv = TopvisorService()
         project_id = tv.create_project(target_domain)
         status_log.append(f"✅ Topvisor project created: ID={project_id}")
 
+        # ВАЖНО: добавляем Яндекс + регион + phone и получаем regions_index
+        region_index = tv.setup_yandex_mobile_region_and_get_index(project_id, region_id, depth=1)
+        status_log.append(f"🔧 Topvisor positions setup: yandex region={region_id} device=phone | region_index={region_index}")
+
         added = tv.add_keywords(project_id, clean_for_tv)
         stats["topvisor_added"] = int(added or 0)
         status_log.append(f"🚀 Topvisor added: {stats['topvisor_added']}")
+
+        # Запуск проверки ПОЗИЦИЙ один раз
+        check_resp = tv.check_positions_once(project_id, region_index=region_index, do_snapshots=0)
+        status_log.append(f"📈 Topvisor checker/go response: {check_resp}")
+
+        # Дебаг: посмотрим процент (не обязателен, но полезен)
+        percent = tv.get_positions_percent(project_id)
+        status_log.append(f"📊 Topvisor positions_percent: {percent}")
+
+        # (если хочешь — можешь сохранить ответ в stats)
+        stats["topvisor_positions_check"] = check_resp
 
         samples = {
             "wk_missing_sample": missing[:30],

@@ -1,5 +1,9 @@
-import requests
+import csv
+import io
 import json
+from typing import Any, Dict, List, Optional
+
+import requests
 from app.config import settings
 
 
@@ -12,38 +16,53 @@ class TopvisorService:
             "Authorization": f"Bearer {settings.TV_API_KEY}",
         }
 
-    def _request(self, module: str, method: str, command: str, params: dict = None):
+    # -----------------------------
+    # Base request
+    # -----------------------------
+    def _request(
+        self,
+        module: str,
+        method: str,
+        command: str,
+        params: Optional[dict] = None,
+        *,
+        expect_json: bool = True,
+        timeout: int = 60,
+    ):
         if params is None:
             params = {}
 
         url = f"{self.base_url}/{command}/{module}/{method}"
 
         try:
-            response = requests.post(url, headers=self.headers, json=params)
+            response = requests.post(url, headers=self.headers, json=params, timeout=timeout)
             response.raise_for_status()
+
+            if not expect_json:
+                return response  # raw response (csv/file)
 
             data = response.json()
 
             # --- DEBUG ---
             # print(f"\nAPI REQ: {command}/{module}/{method}")
-            # print(f"DATA: {data}")
+            # print(f"DATA: {json.dumps(data, ensure_ascii=False)[:2000]}")
             # -------------
 
-            if "errors" in data and data["errors"]:
+            if isinstance(data, dict) and data.get("errors"):
                 raise Exception(f"Topvisor API Error: {str(data['errors'])}")
 
             return data.get("result", data)
 
         except Exception as e:
-            print(f"CRITICAL API ERROR: {str(e)}")
-            raise e
+            print(f"CRITICAL API ERROR: {str(e)} | endpoint={command}/{module}/{method}")
+            raise
 
+    # -----------------------------
+    # Projects / Keywords
+    # -----------------------------
     def create_project(self, site_url: str):
-        # Чистим URL от http/https для красивого имени
         clean_name = site_url.replace("https://", "").replace("http://", "").strip("/")
-
-        params = {"name": clean_name, "url": site_url}  # <--- БОЛЬШЕ НИКАКИХ "Check:"
-
+        params = {"name": clean_name, "url": site_url}
         result = self._request("projects_2", "projects", "add", params)
 
         if isinstance(result, dict):
@@ -55,7 +74,7 @@ class TopvisorService:
 
         raise Exception(f"Error creating project: {result}")
 
-    def add_keywords(self, project_id: int, keywords_data: list):
+    def add_keywords(self, project_id: int, keywords_data: list) -> int:
         """
         keywords_data: список словарей [{'phrase': '...', 'group': '...'}]
         """
@@ -64,182 +83,365 @@ class TopvisorService:
 
         print(f"Импорт {len(keywords_data)} ключей с группами...")
 
-        # Формируем CSV для импорта
-        # В документации поля: name (запрос), group_name (имя группы/папки)
-        # В качестве разделителя используем точку с запятой ';', это надежнее запятой
-
-        csv_lines = ["name;group_name"]  # Заголовок
-
+        csv_lines = ["name;group_name"]  # header
         for item in keywords_data:
-            # Экранируем точку с запятой в самом запросе, если вдруг есть
-            clean_phrase = item["phrase"].replace(";", "")
-            clean_group = item["group"].replace(";", "")
+            phrase = str(item.get("phrase", "")).replace(";", "").strip()
+            group = str(item.get("group", "General")).replace(";", "").strip() or "General"
+            if not phrase:
+                continue
+            csv_lines.append(f"{phrase};{group}")
 
-            line = f"{clean_phrase};{clean_group}"
-            csv_lines.append(line)
-
-        # Склеиваем всё в одну строку
         csv_content = "\n".join(csv_lines)
 
-        params = {
-            "project_id": project_id,
-            "keywords": csv_content,
-        }
-
-        # Отправляем
+        params = {"project_id": project_id, "keywords": csv_content}
         result = self._request("keywords_2", "keywords/import", "add", params)
 
         if isinstance(result, dict):
-            added = result.get("countAdded", 0)
+            added = int(result.get("countAdded", 0) or 0)
             print(f"Импортировано: {added}")
             return added
 
         return len(keywords_data)
 
-    def start_volume_checking(self, project_id: int, region_key: int = 225):
-        """
-        Запускает проверку частоты.
-        region_key: 225 - это Россия (Yandex).
-        """
-        params = {
-            "project_id": project_id,
-            "searcher_key": 0,  # 0 - Яндекс
-            "region_key": region_key,
-        }
-
-        # В V2 проверка частоты запускается через добавление задачи в Task Manager
-        # Модуль: task_2, Метод: task, Команда: add
-        # Параметры задачи определяют, что мы собираем volume
-
-        # ПРИМЕЧАНИЕ: В Топвизоре специфичная логика. Чтобы снять частоту,
-        # нужно создать задачу типа "Standard positions" или специальную volume задачу.
-        # Однако, самый простой способ для v2 — вызвать volume collecting.
-
-        # Пробуем через endpoint "проверка частоты": /add/snapshots_2/volume
-        # Если его нет, идем через задачи. Самый надежный путь в V2 - tasks.
-
-        task_params = {
-            "project_id": project_id,
-            "name": "Semyon_Volume_Check",  # Название задачи
-            "type": "volume",  # Тип задачи: сбор частот
-            "params": {
-                "searcher_key": 0,  # Яндекс
-                "region_key": region_key,  # Россия
-                "engine": "yandex",  # Уточняем движок
-            },
-        }
-
-        result = self._request("task_2", "task", "add", task_params)
-
-        # Возвращает id задачи (task_id)
-        return result.get("id")
-
-    def get_task_status(self, task_id: int):
-        """Проверяет состояние задачи по её ID"""
-        params = {"id": task_id}
-        result = self._request("task_2", "task", "get", params)
-
-        # Если пришел список (бывает), берем первый элемент
-        if isinstance(result, list) and result:
-            result = result[0]
-
-        # Нас интересует статус.
-        # Возможные статусы: "process_wait", "process", "done", "error"
-        return result.get("status_key")  # Вернет строку статуса
-
-    def get_keywords_with_volume(self, project_id: int):
-        """Получает список ключей и их частоту"""
-        params = {
-            "project_id": project_id,
-            "fields": ["id", "name", "volume"],
-            "show_volume": 1,
-        }
-        # get / keywords_2 / keywords
-        return self._request("keywords_2", "keywords", "get", params)
-
-    def delete_keywords(self, project_id: int, keyword_ids: list):
-        """Удаляет ключи по ID"""
-        if not keyword_ids:
-            return
-
-        params = {"project_id": project_id, "ids": keyword_ids}
-        # del / keywords_2 / keywords
-        return self._request("keywords_2", "keywords", "del", params)
-
-    def search_region(self, query: str):
-        """
-        Ищет регион по названию.
-        Используем V2 Filters, так как прямой параметр 'name' может вызывать ошибку 1003.
-        """
-
-        # Топвизор V2 просит передавать фильтры сложной структурой
-        params = {
-            "filters": [
-                {
-                    "name": "name",  # Поле, по которому ищем
-                    "operator": "LIKE",  # Ищем совпадения (похоже на...)
-                    "values": [f"%{query}%"],  # %Красно%
-                },
-                {
-                    # Фильтруем только страны (0) и регионы (1, 2...)
-                    # Чтобы не мусорить районами, можно убрать этот блок, если нужно всё подряд
-                    "name": "country_id",
-                    "operator": "NOT_EQUALS",
-                    "values": ["0"],  # Пример фильтрации (не обязательно)
-                },
-            ],
-            "fields": ["id", "name", "path", "type"],  # Явно просим вернуть эти поля
-            "limit": 20,  # Не тащим всю базу, только топ-20 совпадений
-        }
-
-        # Вызываем: get / regions_2 / regions
-        result = self._request("regions_2", "regions", "get", params)
-
-        # Если API вернул список - обрабатываем
-        if isinstance(result, list):
-            output = []
-            for item in result:
-                # Формируем красивый ответ
-                output.append(
-                    {
-                        "id": item.get("id"),
-                        "name": item.get("name"),
-                        "details": item.get("path", ""),  # "Россия.Сибирь..."
-                    }
-                )
-            return output
-
-        return []
-
+    # -----------------------------
+    # OLD (оставил для совместимости, но для позиций НЕ использовать)
+    # -----------------------------
     def setup_searcher(self, project_id: int, region_key: int, is_mobile: bool = True):
         """
-        Добавляет поисковик (Яндекс) с указанием Региона и Устройства.
-
-        region_key: ID города (например, 213)
-        is_mobile: True = Mobile (Смартфон), False = Desktop
+        ⚠️ УСТАРЕВШЕЕ: это projects_2/searchers.
+        Для проверки позиций нужен positions_2 (см. ensure_yandex_mobile_region).
         """
-        # В Топвизоре V2 (module projects_2, component searchers):
-        # searcher_key: 0 - Яндекс, 1 - Google
-        # device_key: 0 - PC, 1 - Tablet, 2 - Mobile (Phone) - точные ID зависят от ПС, но для Яндекса обычно:
-        # device: 0 (Десктоп), 1 (Планшет), 2 (Мобильный)
-        # *В некоторых версиях API параметр может называться 'type'.
-        # Попробуем стандарт: device_key = 2 (Mobile).
-
         device_val = 2 if is_mobile else 0
         device_name = "Mobile" if is_mobile else "Desktop"
 
         params = {
             "project_id": project_id,
-            "searcher_key": 0,  # Яндекс
+            "searcher_key": 0,  # Yandex
             "region_key": region_key,
             "device_key": device_val,
             "enabled": 1,
         }
 
-        # add / projects_2 / searchers
         print(
-            f"Добавляем поиск: Яндекс | Регион: {region_key} | Устройство: {device_name} (key={device_val})"
+            f"[DEPRECATED] projects_2/searchers: Яндекс | Регион: {region_key} | {device_name}"
         )
 
-        result = self._request("projects_2", "searchers", "add", params)
-        return result
+        return self._request("projects_2", "searchers", "add", params)
+
+    # -----------------------------
+    # Regions search (как у тебя было)
+    # -----------------------------
+    def search_region(self, query: str):
+        params = {
+            "filters": [
+                {"name": "name", "operator": "LIKE", "values": [f"%{query}%"]},
+                {"name": "country_id", "operator": "NOT_EQUALS", "values": ["0"]},
+            ],
+            "fields": ["id", "name", "path", "type"],
+            "limit": 20,
+        }
+
+        result = self._request("regions_2", "regions", "get", params)
+
+        if isinstance(result, list):
+            return [
+                {"id": item.get("id"), "name": item.get("name"), "details": item.get("path", "")}
+                for item in result
+            ]
+        return []
+
+    # -----------------------------
+    # Positions RankTracker: Yandex + Region + Mobile + one-time check
+    # -----------------------------
+    @staticmethod
+    def _decode_bytes(raw: bytes) -> str:
+        for enc in ("utf-8-sig", "utf-8", "cp1251"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _parse_csv_any_delim(text: str) -> List[List[str]]:
+        candidates = [";", "\t", ","]
+        best_rows: List[List[str]] = []
+        best_cols = -1
+
+        for delim in candidates:
+            try:
+                rows = []
+                reader = csv.reader(io.StringIO(text), delimiter=delim)
+                for r in reader:
+                    if any((c or "").strip() for c in r):
+                        rows.append(r)
+                cols = max((len(r) for r in rows[:10]), default=0)
+                if cols > best_cols:
+                    best_cols = cols
+                    best_rows = rows
+            except Exception:
+                continue
+
+        return best_rows
+
+    def ensure_yandex_mobile_region(
+        self,
+        project_id: int,
+        region_key: int,
+        *,
+        depth: int = 1,
+        lang: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Делает:
+        1) add/positions_2/searchers  (Яндекс)
+        2) add/positions_2/searchers_regions (регион + phone + depth)
+        3) вычисляет regions_index для checker/go
+        """
+        # 1) add searcher
+        try:
+            self._request("positions_2", "searchers", "add", {"project_id": project_id, "searcher_key": 0})
+            searcher_added = True
+        except Exception as e:
+            print(f"Topvisor: searcher add skipped/failed (maybe exists): {e}")
+            searcher_added = False
+
+        # 2) add region (device=phone)
+        params = {
+            "project_id": project_id,
+            "searcher_key": 0,
+            "region_key": int(region_key),
+            "region_device": 2,     # 0 desktop, 1 tablet, 2 phone
+            "region_depth": int(depth),
+        }
+        if lang:
+            params["region_lang"] = lang
+
+        try:
+            self._request("positions_2", "searchers_regions", "add", params)
+            region_added = True
+        except Exception as e:
+            print(f"Topvisor: region add skipped/failed (maybe exists): {e}")
+            region_added = False
+
+        region_index = self._resolve_region_index_from_export(
+            project_id=project_id,
+            searcher_key=0,
+            region_key=int(region_key),
+            device=2,
+            depth=int(depth),
+        )
+
+        return {
+            "searcher_added": searcher_added,
+            "region_added": region_added,
+            "region_index": region_index,
+            "searcher_key": 0,
+            "region_key": int(region_key),
+            "region_device": 2,
+            "region_depth": int(depth),
+        }
+
+    def _export_searchers_regions_csv(self, project_id: int) -> str:
+        resp = self._request(
+            "positions_2",
+            "searchers_regions/export",
+            "get",
+            {"project_id": project_id},
+            expect_json=False,
+            timeout=60,
+        )
+        return self._decode_bytes(resp.content or b"")
+
+    def _resolve_region_index_from_export(
+        self,
+        *,
+        project_id: int,
+        searcher_key: int,
+        region_key: int,
+        device: int,
+        depth: int,
+    ) -> int:
+        """
+        regions_indexes для checker/go — это "индексы регионов" в проекте.
+        Самый надёжный путь — взять export и найти нужную строку.
+        """
+        try:
+            csv_text = self._export_searchers_regions_csv(project_id)
+            rows = self._parse_csv_any_delim(csv_text)
+            if not rows:
+                return 0
+
+            # если есть хедер — пропускаем
+            def _is_int(x: str) -> bool:
+                try:
+                    int(str(x).strip())
+                    return True
+                except Exception:
+                    return False
+
+            start = 0
+            if rows and (not _is_int(rows[0][0] if rows[0] else "")):
+                start = 1
+
+            data_rows = rows[start:]
+            for idx, cols in enumerate(data_rows):
+                # expected columns:
+                # 0 searcher_key, 1 region_key, 4 device, 5 depth
+                c0 = cols[0].strip() if len(cols) > 0 else ""
+                c1 = cols[1].strip() if len(cols) > 1 else ""
+                c4 = cols[4].strip() if len(cols) > 4 else ""
+                c5 = cols[5].strip() if len(cols) > 5 else ""
+
+                if not c0 or not c1:
+                    continue
+
+                try:
+                    row_searcher = int(c0)
+                    row_region = int(c1)
+                    row_device = int(c4 or 0)
+                    row_depth = int(c5 or 1)
+                except Exception:
+                    continue
+
+                if (
+                    row_searcher == int(searcher_key)
+                    and row_region == int(region_key)
+                    and row_device == int(device)
+                    and row_depth == int(depth)
+                ):
+                    return idx  # 0-based
+
+            return 0
+        except Exception as e:
+            print(f"Topvisor: failed to resolve region_index, fallback=0 | {e}")
+            return 0
+
+    def check_positions_once(self, project_id: int, *, region_index: int, do_snapshots: int = 0) -> Dict[str, Any]:
+        """
+        edit/positions_2/checker/go — запускает разовую проверку позиций.
+        """
+        params = {
+            "filters": [{"name": "id", "operator": "EQUALS", "values": [int(project_id)]}],
+            "regions_indexes": [int(region_index)],
+            "do_snapshots": int(do_snapshots),
+        }
+
+        # 1) пробуем 0-based
+        try:
+            result = self._request("positions_2", "checker/go", "edit", params)
+            return {"ok": True, "region_index_used": int(region_index), "result": result}
+        except Exception as e:
+            # 2) fallback на 1-based (иногда встречается на аккаунтах/проектах)
+            try:
+                params["regions_indexes"] = [int(region_index) + 1]
+                result = self._request("positions_2", "checker/go", "edit", params)
+                return {"ok": True, "region_index_used": int(region_index) + 1, "result": result, "fallback": "1-based"}
+            except Exception:
+                return {"ok": False, "error": str(e), "region_index_tried": int(region_index)}
+
+    def setup_yandex_mobile_region_and_get_index(self, project_id: int, region_key: int, depth: int = 1) -> int:
+        """
+        1) Добавляет Яндекс в Rank Tracker (positions_2/searchers)
+        2) Добавляет регион+устройство phone (positions_2/searchers_regions)
+        3) Возвращает regions_index из get/projects_2/projects (show_searchers_and_regions)
+        """
+        # 1) add searcher (Yandex = 0)
+        try:
+            self._request("positions_2", "searchers", "add", {"project_id": project_id, "searcher_key": 0})
+        except Exception as e:
+            # если уже есть — не критично
+            print(f"Topvisor: searcher add skipped/failed (maybe exists): {e}")
+
+        # 2) add region for phone
+        try:
+            self._request(
+                "positions_2",
+                "searchers_regions",
+                "add",
+                {
+                    "project_id": project_id,
+                    "searcher_key": 0,
+                    "region_key": int(region_key),
+                    "region_device": 2,     # 0 desktop, 1 tablet, 2 phone
+                    "region_depth": int(depth),
+                },
+            )
+        except Exception as e:
+            print(f"Topvisor: region add skipped/failed (maybe exists): {e}")
+
+        # 3) resolve regions_index (самый правильный способ)
+        idx = self.get_regions_index(project_id, searcher_key=0, region_key=int(region_key), device=2)
+        return int(idx)
+
+    def get_regions_index(self, project_id: int, searcher_key: int, region_key: int, device: int = 2) -> int:
+        """
+        Берём index из get/projects_2/projects при show_searchers_and_regions=2.
+        Это тот самый regions_indexes, который нужен для checker/go.
+        """
+        params = {
+            "limit": 1,
+            "show_searchers_and_regions": 2,
+            "filters": [{"name": "id", "operator": "EQUALS", "values": [str(project_id)]}],
+        }
+        proj_list = self._request("projects_2", "projects", "get", params)
+        if not isinstance(proj_list, list) or not proj_list:
+            return 0
+
+        proj = proj_list[0] if isinstance(proj_list[0], dict) else {}
+        # Варианты структуры могут отличаться, поэтому делаем “мягкий” обход
+        searchers = proj.get("searchers") or proj.get("positions_searchers") or []
+
+        def _as_int(x, default=0):
+            try:
+                return int(str(x).strip())
+            except Exception:
+                return default
+
+        for s in searchers:
+            if not isinstance(s, dict):
+                continue
+            if _as_int(s.get("searcher_key", s.get("key"))) != _as_int(searcher_key):
+                continue
+
+            regions = s.get("regions") or s.get("searchers_regions") or s.get("locations") or []
+            for r in regions:
+                if not isinstance(r, dict):
+                    continue
+
+                r_key = _as_int(r.get("region_key", r.get("key", r.get("id"))))
+                r_dev = _as_int(r.get("region_device", r.get("device", r.get("device_key"))))
+                r_idx = _as_int(r.get("index"))
+
+                if r_key == _as_int(region_key) and r_dev == _as_int(device) and r_idx is not None:
+                    return r_idx
+
+        return 0
+
+
+    def check_positions_once(self, project_id: int, region_index: int, do_snapshots: int = 0):
+        """
+        Запускает разовую проверку позиций.
+        Ожидаемый ответ: {"projectsIds":[...]}
+        """
+        params = {
+            "filters": [{"name": "id", "operator": "EQUALS", "values": [str(project_id)]}],
+            "regions_indexes": [int(region_index)],
+            "do_snapshots": int(do_snapshots),
+        }
+        return self._request("positions_2", "checker/go", "edit", params)
+
+
+    def get_positions_percent(self, project_id: int):
+        """
+        Удобно дебажить: если проверка стартанула, positions_percent начнёт меняться.
+        """
+        params = {
+            "limit": 1,
+            "fields": ["positions_percent"],
+            "filters": [{"name": "id", "operator": "EQUALS", "values": [str(project_id)]}],
+        }
+        res = self._request("projects_2", "projects", "get", params)
+        if isinstance(res, list) and res and isinstance(res[0], dict):
+            return res[0].get("positions_percent")
+        return None
